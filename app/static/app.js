@@ -9,11 +9,14 @@ const state = {
   segments: [],   // 原始轨迹 [[{lat,lon,ele,time},...],...]
   circles: [],    // [{lat, lon, radius_m}]
   masked: null,   // /api/mask 返回结果
+  elevation: null, // /api/elevation 返回结果
   transform: null,
 };
 
 const canvas = document.getElementById("map");
 const ctx = canvas.getContext("2d");
+const profileCanvas = document.getElementById("profile");
+const profileCtx = profileCanvas.getContext("2d");
 
 /* ---------- 坐标变换：经纬度 <-> 画布像素 ---------- */
 
@@ -181,11 +184,13 @@ async function uploadFile(file) {
   state.segments = data.segments;
   state.circles = [];
   state.masked = null;
+  state.elevation = null;
   computeTransform();
   renderTrackInfo(data.stats);
   renderCircleList();
   await refreshMask();
   await refreshPace();
+  await refreshElevation();
 }
 
 let paceTimer = null;
@@ -217,6 +222,27 @@ async function refreshPace() {
     el.classList.remove("muted");
     el.innerHTML = `<div class="pace-error">无法计算分段配速：${escapeHtml(err.message)}</div>`;
   }
+}
+
+async function refreshElevation() {
+  if (!state.trackId) return;
+  const el = document.getElementById("elevation-summary");
+  try {
+    const res = await fetch("/api/elevation", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ track_id: state.trackId }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(errDetail(data, "海拔分析失败"));
+    state.elevation = data;
+    renderElevation(data);
+  } catch (err) {
+    state.elevation = null;
+    el.classList.remove("muted");
+    el.innerHTML = `<div class="pace-error">无法计算海拔剖面：${escapeHtml(err.message)}</div>`;
+  }
+  drawProfile();
 }
 
 async function downloadGpx() {
@@ -312,6 +338,110 @@ function renderPace(data) {
   el.innerHTML = html;
 }
 
+function renderElevation(data) {
+  const el = document.getElementById("elevation-summary");
+  el.classList.remove("muted");
+  if (!data.has_ele) {
+    el.innerHTML = "<div>无海拔数据</div>";
+    return;
+  }
+  el.innerHTML =
+    `<div>总爬升：<b>${Math.round(data.ascent_m)} m</b>，` +
+    `总下降：<b>${Math.round(data.descent_m)} m</b></div>` +
+    `<div>海拔范围：<b>${data.ele_min.toFixed(0)}</b> ~ ` +
+    `<b>${data.ele_max.toFixed(0)}</b> m，里程 ${fmtKm(data.distance_m)} km</div>`;
+}
+
+/* 海拔剖面图：x 轴为全程里程，y 轴为海拔；每个连续有效区间一条折线，区间间断开 */
+function drawProfile() {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = profileCanvas.getBoundingClientRect();
+  profileCanvas.width = Math.max(1, Math.round(rect.width * dpr));
+  profileCanvas.height = Math.max(1, Math.round(rect.height * dpr));
+  const W = profileCanvas.width, H = profileCanvas.height;
+  profileCtx.clearRect(0, 0, W, H);
+  profileCtx.fillStyle = "#f7f7f5";
+  profileCtx.fillRect(0, 0, W, H);
+
+  const data = state.elevation;
+  if (!data || !data.has_ele || !data.runs.length) {
+    profileCtx.fillStyle = "#9e9e9e";
+    profileCtx.font = `${14 * dpr}px sans-serif`;
+    profileCtx.textAlign = "center";
+    profileCtx.textBaseline = "middle";
+    profileCtx.fillText(
+      data && !data.has_ele ? "无海拔数据" : "上传 GPX 后在此显示海拔剖面",
+      W / 2, H / 2
+    );
+    profileCtx.textBaseline = "alphabetic";
+    return;
+  }
+
+  const padL = 46 * dpr, padR = 14 * dpr, padT = 12 * dpr, padB = 26 * dpr;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+  const dist = Math.max(data.distance_m, 1e-9);
+  let eMin = data.ele_min, eMax = data.ele_max;
+  if (eMax - eMin < 1) {  // 近乎水平：扩量程避免除零
+    const mid = (eMax + eMin) / 2;
+    eMin = mid - 0.5;
+    eMax = mid + 0.5;
+  }
+  const px = (d) => padL + (d / dist) * plotW;
+  const py = (e) => padT + plotH - ((e - eMin) / (eMax - eMin)) * plotH;
+
+  // 网格与刻度
+  profileCtx.strokeStyle = "#e4e4e1";
+  profileCtx.fillStyle = "#999";
+  profileCtx.lineWidth = 1 * dpr;
+  profileCtx.font = `${10 * dpr}px sans-serif`;
+  const xTicks = 5;
+  for (let i = 0; i <= xTicks; i++) {
+    const d = (dist / xTicks) * i;
+    const x = px(d);
+    profileCtx.beginPath();
+    profileCtx.moveTo(x, padT);
+    profileCtx.lineTo(x, padT + plotH);
+    profileCtx.stroke();
+    profileCtx.textAlign = i === 0 ? "left" : i === xTicks ? "right" : "center";
+    profileCtx.fillText((d / 1000).toFixed(1) + (i === xTicks ? " km" : ""),
+      x, padT + plotH + 15 * dpr);
+  }
+  const yTicks = 4;
+  for (let i = 0; i <= yTicks; i++) {
+    const e = eMin + ((eMax - eMin) / yTicks) * i;
+    const y = py(e);
+    profileCtx.beginPath();
+    profileCtx.moveTo(padL, y);
+    profileCtx.lineTo(padL + plotW, y);
+    profileCtx.stroke();
+    profileCtx.textAlign = "right";
+    profileCtx.fillText(e.toFixed(0) + (i === yTicks ? " m" : ""),
+      padL - 5 * dpr, y + 3 * dpr);
+  }
+
+  // 海拔折线：每个连续有效区间一条，区间之间断开
+  profileCtx.strokeStyle = "#1e88e5";
+  profileCtx.fillStyle = "#1e88e5";
+  profileCtx.lineWidth = 2 * dpr;
+  profileCtx.lineJoin = "round";
+  for (const run of data.runs) {
+    if (run.points.length === 1) {  // 单点区间：画一个小圆点
+      const p = run.points[0];
+      profileCtx.beginPath();
+      profileCtx.arc(px(p.d), py(p.ele), 2.5 * dpr, 0, Math.PI * 2);
+      profileCtx.fill();
+      continue;
+    }
+    profileCtx.beginPath();
+    run.points.forEach((p, i) => {
+      if (i === 0) profileCtx.moveTo(px(p.d), py(p.ele));
+      else profileCtx.lineTo(px(p.d), py(p.ele));
+    });
+    profileCtx.stroke();
+  }
+}
+
 function renderTrackInfo(s) {
   const el = document.getElementById("track-info");
   el.classList.remove("muted");
@@ -395,6 +525,7 @@ function resizeCanvas() {
   canvas.height = Math.max(1, Math.round(rect.height * dpr));
   computeTransform();
   draw();
+  drawProfile();
 }
 
 document.getElementById("file").addEventListener("change", (e) => {

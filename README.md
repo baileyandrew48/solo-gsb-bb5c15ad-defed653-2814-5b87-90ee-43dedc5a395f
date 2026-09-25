@@ -1,6 +1,6 @@
 # 徒步轨迹分享 · 敏感地点遮蔽
 
-上传含时间的 GPX 轨迹，自动统计**分段配速**；在**无底图**预览图上点击敏感地点（如家、公司）
+上传含时间的 GPX 轨迹，自动统计**分段配速**与**海拔剖面 / 累计爬升**；在**无底图**预览图上点击敏感地点（如家、公司）
 并设定遮蔽半径，系统按**轨迹线段与遮蔽圆的交点**精确裁切，导出为**互不连接的 GPX `trkseg`** 后再分享。
 
 - 后端：Python / FastAPI（几何裁切与配速统计在服务端完成）
@@ -35,11 +35,13 @@ docker compose up --build
    `examples/sample.gpx` 快速体验。
 2. **查看分段配速**：上传后页面下方自动按**每段里程**（0.1～10 公里，默认 1 公里，
    可修改后自动重算）列出每段的距离、耗时、分/公里配速与起止时间。
-3. **设置遮蔽**：在右侧预览图上**点击**敏感地点即添加遮蔽圆，半径在左侧面板设定
+3. **查看海拔剖面**：页面底部自动绘制**按里程展开的海拔曲线**，并给出**总爬升 / 总下降**
+   与海拔范围；轨迹无海拔信息时显示"无海拔数据"。
+4. **设置遮蔽**：在右侧预览图上**点击**敏感地点即添加遮蔽圆，半径在左侧面板设定
    （添加前设定新圆半径；已有圆可在列表中单独修改或删除）。
-4. **查看裁切结果**：页面实时显示 **隐藏段数**、**裁切前距离**、**裁切后距离** 与可见分段数；
+5. **查看裁切结果**：页面实时显示 **隐藏段数**、**裁切前距离**、**裁切后距离** 与可见分段数；
    蓝色为可见轨迹，红色虚线为被隐藏段。
-5. **下载**：点击"下载遮蔽后的 GPX"，得到一条 `trk` 下多个互不连接的 `trkseg`。
+6. **下载**：点击"下载遮蔽后的 GPX"，得到一条 `trk` 下多个互不连接的 `trkseg`。
 
 ## 分段配速规则（实现要点）
 
@@ -51,6 +53,20 @@ docker compose up --build
 - **时间不递增**：同一 trkseg 内相邻轨迹点时间相同或倒退时无法插值，接口返回 400
   并在页面提示"无法计算配速"。
 - **零里程段**：距离为 0 的段（如整段原地不动）配速显示为 "—"，不显示无穷大。
+
+## 海拔剖面与累计爬升规则（实现要点）
+
+- **基于原始轨迹**：分析使用上传时保存的原始 GPX（各原始 `trkseg`），与遮蔽裁切、
+  配速统计互不影响；设置遮蔽圆不会改变海拔分析结果。
+- **连续有效海拔区间**：每个 `trkseg` 内，`ele` 非空的极大连续子序列各自构成一个区间；
+  缺失海拔处断开，不跨原始分段或缺口插值。
+- **20 米重采样**：区间内按 haversine 水平里程每 **20 米**线性插值采样海拔，
+  区间起点与终点始终保留（末段不足 20 米也保留终点）。
+- **三点中位数**：对采样海拔做三点中位数滤波（序列端点保持原值），抑制孤立尖峰。
+- **5 米反向确认峰谷**：趋势极值被反向变化超过 **5 米**时确认一个峰/谷，
+  累计已确认的上升与下降；区间末尾未确认的变化也计入；各区间独立累计后求和。
+- **无海拔数据**：全程无任何有效海拔时接口返回 `has_ele=false`、爬升/下降为 `null`，
+  页面显示"无海拔数据"而不是 0 米爬升。
 
 ## 裁切规则（实现要点）
 
@@ -68,13 +84,14 @@ docker compose up --build
 
 ```
 app/
-  main.py          # FastAPI 路由：/api/upload、/api/mask、/api/export、/api/pace、静态页面
+  main.py          # FastAPI 路由：/api/upload、/api/mask、/api/export、/api/pace、/api/elevation、静态页面
   geo.py           # 几何核心：haversine、线段-圆求交、按可见性裁切
   pace.py          # 分段配速：按固定里程切段、边界时间插值
+  elevation.py     # 海拔剖面：20 米重采样、三点中位数、5 米反向确认峰谷、累计爬升/下降
   gpxutil.py       # GPX 1.1 解析（强制要求 time）与多 trkseg 导出
   static/          # 原生 JS 前端（index.html / app.js / style.css）
-tests/             # 单元测试：test_geo.py（裁切 9 项）、test_pace.py（配速 8 项）
-examples/sample.gpx# 示例轨迹（两个 trkseg，含时间）
+tests/             # 单元测试：test_geo.py（裁切 9 项）、test_pace.py（配速 8 项）、test_elevation.py（海拔 13 项）
+examples/sample.gpx# 示例轨迹（两个 trkseg，含时间与海拔）
 Dockerfile         # python:3.12-slim，构建期安装依赖，启动即运行
 docker-compose.yml # 单服务，映射 8000 端口
 requirements.txt
@@ -87,8 +104,9 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 
 # 运行单元测试（核心逻辑不依赖 FastAPI）
-python3 tests/test_geo.py       # 裁切逻辑
-python3 tests/test_pace.py      # 分段配速
+python3 tests/test_geo.py        # 裁切逻辑
+python3 tests/test_pace.py       # 分段配速
+python3 tests/test_elevation.py  # 海拔剖面与累计爬升
 # 或：python3 -m pytest tests/
 ```
 
@@ -100,6 +118,7 @@ python3 tests/test_pace.py      # 分段配速
 | `POST` | `/api/mask` | `{track_id, circles:[{lat,lon,radius_m}]}` → 可见/隐藏分段、隐藏段数、裁切前后距离 |
 | `POST` | `/api/export` | 同上参数，返回多 `trkseg` 的 GPX 文件下载 |
 | `POST` | `/api/pace` | `{track_id, split_km?}` → 分段配速（见下） |
+| `POST` | `/api/elevation` | `{track_id}` → 海拔剖面与总爬升/总下降（见下） |
 
 ### `POST /api/pace` 分段配速
 
@@ -116,4 +135,22 @@ python3 tests/test_pace.py      # 分段配速
 curl -X POST http://localhost:8000/api/pace \
   -H "Content-Type: application/json" \
   -d '{"track_id": "<上传返回的 track_id>", "split_km": 0.5}'
+```
+
+### `POST /api/elevation` 海拔剖面与累计爬升
+
+- **参数**：`track_id`（必填，上传返回值）。
+- **返回**：`has_ele`（是否存在有效海拔）、`ascent_m` / `descent_m`（总爬升/总下降，
+  无海拔时为 `null`）、`distance_m`（全程水平里程）、`ele_min` / `ele_max`（平滑后海拔范围）、
+  `sample_step_m`（20）与 `reversal_threshold_m`（5）两个口径常量，以及 `runs` 剖面列表；
+  每个 run 含 `seg_index`（原始 `trkseg` 序号）、`start_m`（区间起点的全程里程）和
+  `points`（`[{d, ele}]`，`d` 为全程里程坐标，缺口与分段处断开）。
+- **错误**：`track_id` 不存在返回 `404`。
+
+示例：
+
+```bash
+curl -X POST http://localhost:8000/api/elevation \
+  -H "Content-Type: application/json" \
+  -d '{"track_id": "<上传返回的 track_id>"}'
 ```
