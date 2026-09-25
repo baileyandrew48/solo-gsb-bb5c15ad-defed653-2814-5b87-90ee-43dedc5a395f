@@ -1,4 +1,4 @@
-"""FastAPI 入口：上传 GPX、遮蔽计算、导出、分段配速、静态页面。"""
+"""FastAPI 入口：上传 GPX、遮蔽计算、导出、分段配速、海拔剖面分析、静态页面。"""
 from __future__ import annotations
 
 import uuid
@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .elevation import REVERSAL_THRESHOLD_M, SAMPLE_STEP_M, elevation_profile
 from .geo import MaskCircle, haversine_m, mask_track
 from .gpxutil import build_gpx, parse_gpx
 from .pace import DEFAULT_SPLIT_KM, MAX_SPLIT_KM, MIN_SPLIT_KM, pace_splits
@@ -39,6 +40,10 @@ class MaskRequest(BaseModel):
 class PaceRequest(BaseModel):
     track_id: str
     split_km: float = Field(default=DEFAULT_SPLIT_KM, ge=MIN_SPLIT_KM, le=MAX_SPLIT_KM)
+
+
+class ElevationRequest(BaseModel):
+    track_id: str
 
 
 def _point_dict(p):
@@ -169,6 +174,34 @@ def pace(req: PaceRequest):
                 total_duration / 60.0 / (total_distance / 1000.0)
                 if total_distance > 0 else None
             ),
+        },
+    }
+
+
+@app.post("/api/elevation")
+def elevation(req: ElevationRequest):
+    """海拔剖面与累计爬升：基于上传后保存的原始轨迹计算，不影响遮蔽导出与配速口径。"""
+    track = _get_track(req.track_id)
+    profile = elevation_profile(track["segments"])
+    return {
+        "has_elevation": profile.has_elevation,
+        "sample_step_m": SAMPLE_STEP_M,
+        "reversal_threshold_m": REVERSAL_THRESHOLD_M,
+        "intervals": [
+            {
+                "seg_index": it.seg_index,
+                "ascent_m": it.ascent_m,
+                "descent_m": it.descent_m,
+                "points": [[d, e] for d, e in it.points],
+            }
+            for it in profile.intervals
+        ],
+        "totals": {
+            "distance_m": profile.distance_m,
+            "ascent_m": profile.ascent_m,
+            "descent_m": profile.descent_m,
+            "ele_min": profile.ele_min,
+            "ele_max": profile.ele_max,
         },
     }
 

@@ -1,6 +1,6 @@
 # 徒步轨迹分享 · 敏感地点遮蔽
 
-上传含时间的 GPX 轨迹，自动统计**分段配速**；在**无底图**预览图上点击敏感地点（如家、公司）
+上传含时间的 GPX 轨迹，自动统计**分段配速**与**海拔剖面/累计爬升**；在**无底图**预览图上点击敏感地点（如家、公司）
 并设定遮蔽半径，系统按**轨迹线段与遮蔽圆的交点**精确裁切，导出为**互不连接的 GPX `trkseg`** 后再分享。
 
 - 后端：Python / FastAPI（几何裁切与配速统计在服务端完成）
@@ -25,6 +25,7 @@ docker compose up --build
 | 对外端口 | `docker-compose.yml` 中 `ports` | 默认 `"8000:8000"`，改左侧即可（如 `"8080:8000"`） |
 | 上传大小限制 | `app/main.py` 中 `MAX_UPLOAD_BYTES` | 默认 50 MB |
 | 每段里程 | 页面"分段配速"输入框，或 `/api/pace` 的 `split_km` | 0.1～10 公里，默认 1 公里 |
+| 海拔重采样步长 / 峰谷确认阈值 | `app/elevation.py` 中 `SAMPLE_STEP_M` / `REVERSAL_THRESHOLD_M` | 默认 20 米 / 5 米 |
 | 数据存储 | 内存 | 演示用途：轨迹仅存内存，容器重启即清空，无需数据库 |
 
 无其他必需配置（不需要 API Key、不依赖外部服务）。
@@ -35,11 +36,13 @@ docker compose up --build
    `examples/sample.gpx` 快速体验。
 2. **查看分段配速**：上传后页面下方自动按**每段里程**（0.1～10 公里，默认 1 公里，
    可修改后自动重算）列出每段的距离、耗时、分/公里配速与起止时间。
-3. **设置遮蔽**：在右侧预览图上**点击**敏感地点即添加遮蔽圆，半径在左侧面板设定
+3. **查看海拔剖面**：上传后自动按里程绘制海拔曲线，并给出**总爬升**与**总下降**
+   （基于原始轨迹，与遮蔽设置无关）；轨迹不含海拔时显示"无海拔数据"。
+4. **设置遮蔽**：在右侧预览图上**点击**敏感地点即添加遮蔽圆，半径在左侧面板设定
    （添加前设定新圆半径；已有圆可在列表中单独修改或删除）。
-4. **查看裁切结果**：页面实时显示 **隐藏段数**、**裁切前距离**、**裁切后距离** 与可见分段数；
+5. **查看裁切结果**：页面实时显示 **隐藏段数**、**裁切前距离**、**裁切后距离** 与可见分段数；
    蓝色为可见轨迹，红色虚线为被隐藏段。
-5. **下载**：点击"下载遮蔽后的 GPX"，得到一条 `trk` 下多个互不连接的 `trkseg`。
+6. **下载**：点击"下载遮蔽后的 GPX"，得到一条 `trk` 下多个互不连接的 `trkseg`。
 
 ## 分段配速规则（实现要点）
 
@@ -51,6 +54,20 @@ docker compose up --build
 - **时间不递增**：同一 trkseg 内相邻轨迹点时间相同或倒退时无法插值，接口返回 400
   并在页面提示"无法计算配速"。
 - **零里程段**：距离为 0 的段（如整段原地不动）配速显示为 "—"，不显示无穷大。
+
+## 海拔剖面与累计爬升（实现要点）
+
+- **基于原始轨迹**：分析使用上传后保存的原始 GPX 轨迹，与遮蔽圆设置无关，
+  不改变遮蔽导出与配速口径。
+- **连续有效区间**：在每个原始 `trkseg` 内找出连续含有效 `<ele>` 的区间；
+  缺失海拔处断开，不跨原始分段或缺口插值（缺口距离仍计入里程横轴）。
+- **20 米重采样**：每个区间按水平里程（haversine 累计）每 **20 米**线性插值重采样，
+  区间端点也保留（末端不足 20 米的端点同样列出）。
+- **三点中位数**：对采样海拔做窗口为 3 的中位数滤波（端点不变），抑制孤立尖峰。
+- **5 米确认峰谷**：反向变化达到 **5 米**才确认一个峰/谷并累计自上一确认点以来的
+  上升/下降；不足阈值的抖动视为噪声；**尾端未确认的变化也计入**。
+- **无海拔数据**：全程无任何有效海拔时接口返回 `has_elevation: false`、
+  爬升/下降为 `null`，页面显示"无海拔数据"而非零爬升。
 
 ## 裁切规则（实现要点）
 
@@ -68,13 +85,14 @@ docker compose up --build
 
 ```
 app/
-  main.py          # FastAPI 路由：/api/upload、/api/mask、/api/export、/api/pace、静态页面
+  main.py          # FastAPI 路由：/api/upload、/api/mask、/api/export、/api/pace、/api/elevation、静态页面
   geo.py           # 几何核心：haversine、线段-圆求交、按可见性裁切
   pace.py          # 分段配速：按固定里程切段、边界时间插值
+  elevation.py     # 海拔剖面：20 米重采样、三点中位数、5 米反向确认峰谷
   gpxutil.py       # GPX 1.1 解析（强制要求 time）与多 trkseg 导出
   static/          # 原生 JS 前端（index.html / app.js / style.css）
-tests/             # 单元测试：test_geo.py（裁切 9 项）、test_pace.py（配速 8 项）
-examples/sample.gpx# 示例轨迹（两个 trkseg，含时间）
+tests/             # 单元测试：test_geo.py（裁切 9 项）、test_pace.py（配速 8 项）、test_elevation.py（海拔 8 项）
+examples/sample.gpx# 示例轨迹（两个 trkseg，含时间与海拔）
 Dockerfile         # python:3.12-slim，构建期安装依赖，启动即运行
 docker-compose.yml # 单服务，映射 8000 端口
 requirements.txt
@@ -89,6 +107,7 @@ uvicorn app.main:app --reload --port 8000
 # 运行单元测试（核心逻辑不依赖 FastAPI）
 python3 tests/test_geo.py       # 裁切逻辑
 python3 tests/test_pace.py      # 分段配速
+python3 tests/test_elevation.py # 海拔剖面与累计爬升
 # 或：python3 -m pytest tests/
 ```
 
@@ -100,6 +119,7 @@ python3 tests/test_pace.py      # 分段配速
 | `POST` | `/api/mask` | `{track_id, circles:[{lat,lon,radius_m}]}` → 可见/隐藏分段、隐藏段数、裁切前后距离 |
 | `POST` | `/api/export` | 同上参数，返回多 `trkseg` 的 GPX 文件下载 |
 | `POST` | `/api/pace` | `{track_id, split_km?}` → 分段配速（见下） |
+| `POST` | `/api/elevation` | `{track_id}` → 海拔剖面与累计爬升（见下） |
 
 ### `POST /api/pace` 分段配速
 
@@ -116,4 +136,26 @@ python3 tests/test_pace.py      # 分段配速
 curl -X POST http://localhost:8000/api/pace \
   -H "Content-Type: application/json" \
   -d '{"track_id": "<上传返回的 track_id>", "split_km": 0.5}'
+```
+
+### `POST /api/elevation` 海拔剖面与累计爬升
+
+- **参数**：`track_id`（必填，上传返回值）。重采样步长（20 米）与峰谷确认阈值（5 米）
+  为服务端固定口径，无需传参。
+- **返回**：
+  - `has_elevation`：是否存在有效海拔；为 `false` 时 `intervals` 为空、
+    爬升/下降为 `null`（页面据此显示"无海拔数据"而非零爬升）。
+  - `intervals`：连续有效海拔区间列表，每项含 `seg_index`（原始 `trkseg` 序号）、
+    `ascent_m` / `descent_m`（本区间爬升/下降）与 `points`（`[里程 m, 海拔 m]` 数组，
+    里程为全程连续累计，缺口/分段边界处区间断开）。
+  - `totals`：全程 `distance_m`、`ascent_m`、`descent_m`、`ele_min`、`ele_max`。
+  - `sample_step_m` / `reversal_threshold_m`：本次分析使用的口径参数。
+- **错误**：`track_id` 不存在返回 `404`。
+
+示例：
+
+```bash
+curl -X POST http://localhost:8000/api/elevation \
+  -H "Content-Type: application/json" \
+  -d '{"track_id": "<上传返回的 track_id>"}'
 ```

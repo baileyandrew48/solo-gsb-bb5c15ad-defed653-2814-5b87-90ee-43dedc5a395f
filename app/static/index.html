@@ -9,7 +9,7 @@
 <body>
   <header>
     <h1>徒步轨迹分享</h1>
-    <p>上传含时间的 GPX → 自动统计分段配速 → 在预览图上点击敏感地点并设定遮蔽半径 → 导出按遮蔽圆裁切、互不连接的 GPX 分段</p>
+    <p>上传含时间的 GPX → 自动统计分段配速与海拔爬升 → 在预览图上点击敏感地点并设定遮蔽半径 → 导出按遮蔽圆裁切、互不连接的 GPX 分段</p>
   </header>
   <main>
     <section class="panel">
@@ -48,6 +48,12 @@
       <span class="hint">范围 0.1～10，默认 1；按原始 trkseg 分别累计球面距离，末尾不足一段也列出</span>
     </label>
     <div id="pace" class="info muted">上传含时间的 GPX 后自动计算</div>
+  </section>
+
+  <section class="elevation">
+    <h2>5. 海拔剖面与累计爬升</h2>
+    <div id="elevation" class="info muted">上传 GPX 后自动分析（按原始轨迹，与遮蔽无关）</div>
+    <canvas id="profile"></canvas>
   </section>
 
   <div id="message" hidden></div>
